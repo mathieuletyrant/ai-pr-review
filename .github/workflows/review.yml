@@ -1,0 +1,401 @@
+name: ai-review
+
+# Three opencode reviewers (defects, standards, security) on open-weights models through OpenRouter, a merger that
+# keeps only the findings the code confirms, then one GitHub review with inline comments.
+# Reusable: a repo calls it from its own workflow on pull_request and issue_comment (see examples/ai-review.yml).
+# Runs when a PR opens, leaves draft or reopens, on the `ai-review` label, and on a `/ai-review` comment.
+# Secrets: OPENROUTER_API_KEY (required), AI_REVIEW_APP_ID + AI_REVIEW_APP_PRIVATE_KEY (optional GitHub App identity).
+
+on:
+  workflow_call:
+    inputs:
+      reviewer-model:
+        type: string
+        default: openrouter/deepseek/deepseek-v4.1-flash
+      security-model:
+        type: string
+        default: openrouter/z-ai/glm-5.3-flash
+      merger-model:
+        type: string
+        default: openrouter/deepseek/deepseek-v4.1-flash
+      review-name:
+        type: string
+        default: AI
+      kit-ref:
+        description: Ref of mathieuletyrant/ai-pr-review the scripts and agents come from; keep it equal to the @ref of `uses:`.
+        type: string
+        default: v1
+    secrets:
+      OPENROUTER_API_KEY:
+        required: true
+      AI_REVIEW_APP_ID:
+        required: false
+      AI_REVIEW_APP_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: >-
+    ai-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{
+    ((github.event_name == 'issue_comment' && !(github.event.issue.pull_request &&
+    github.event.comment.user.type != 'Bot' &&
+    contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+    startsWith(github.event.comment.body, '/ai-review'))) ||
+    (github.event.action == 'labeled' && github.event.label.name != 'ai-review')) && github.run_id || 'review' }}
+  cancel-in-progress: true
+
+env:
+  OPENCODE_VERSION: 1.18.34
+  NODE_VERSION: 22
+  TOOL: .ai-review-tool
+  AI_REVIEW_NAME: ${{ inputs.review-name }}
+  REVIEWER_MODEL: ${{ inputs.reviewer-model }}
+  SECURITY_MODEL: ${{ inputs.security-model }}
+  MERGER_MODEL: ${{ inputs.merger-model }}
+
+jobs:
+  target:
+    name: AI review (pull request)
+    if: >-
+      (github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(fromJSON('["renovate[bot]", "dependabot[bot]"]'), github.event.pull_request.user.login) &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review')) ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      startsWith(github.event.comment.body, '/ai-review') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      AI_REVIEW_APP_ID: ${{ secrets.AI_REVIEW_APP_ID }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.resolve.outputs.run }}
+      head: ${{ steps.resolve.outputs.head }}
+      base: ${{ steps.resolve.outputs.base }}
+      depth: ${{ steps.resolve.outputs.depth }}
+    steps:
+      - name: Resolve the pull request
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_NUMBER" |
+            jq '{pull_request: ., review: {started_at: (now | todate)}}' > "$RUNNER_TEMP/event.json"
+          if [ "$(jq -r .pull_request.head.repo.full_name "$RUNNER_TEMP/event.json")" != "$GITHUB_REPOSITORY" ]; then
+            echo "::notice::A pull request from a fork gets no AI review."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          head="$(jq -r .pull_request.head.sha "$RUNNER_TEMP/event.json")"
+          base="$(jq -r .pull_request.base.sha "$RUNNER_TEMP/event.json")"
+          depth=0
+          if range="$(gh api "repos/$GITHUB_REPOSITORY/compare/$base...$head" --jq '"\(.merge_base_commit.sha) \(.ahead_by)"')" &&
+            [[ "$range" =~ ^([0-9a-f]{40})\ ([0-9]+)$ ]]; then
+            base="${BASH_REMATCH[1]}"
+            depth=$((BASH_REMATCH[2] + 1))
+            jq --arg base "$base" '.pull_request.base.sha = $base' "$RUNNER_TEMP/event.json" > "$RUNNER_TEMP/event.tmp"
+            mv "$RUNNER_TEMP/event.tmp" "$RUNNER_TEMP/event.json"
+          fi
+          { echo "run=true"; echo "head=$head"; echo "base=$base"; echo "depth=$depth"; } >> "$GITHUB_OUTPUT"
+      - name: Acknowledge the comment
+        if: github.event_name == 'issue_comment' && steps.resolve.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/issues/comments/${{ github.event.comment.id }}/reactions" -f content=eyes
+      - uses: actions/upload-artifact@v4
+        if: steps.resolve.outputs.run == 'true'
+        with:
+          name: ai-review-pull-request
+          path: ${{ runner.temp }}/event.json
+          retention-days: 14
+      - uses: actions/checkout@v4
+        if: steps.resolve.outputs.run == 'true'
+        with:
+          repository: mathieuletyrant/ai-pr-review
+          ref: ${{ inputs.kit-ref }}
+          path: ${{ env.TOOL }}
+          sparse-checkout: .github/ai-review
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        if: steps.resolve.outputs.run == 'true'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Mint the review app's token
+        id: app
+        if: steps.resolve.outputs.run == 'true' && env.AI_REVIEW_APP_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.AI_REVIEW_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+      - name: Mark the review running
+        if: steps.resolve.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          AI_REVIEW_BOT: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || 'github-actions[bot]' }}
+        run: node "$TOOL/.github/ai-review/status.mjs" --state running --event "$RUNNER_TEMP/event.json"
+
+  review:
+    name: AI review (${{ matrix.name }})
+    needs: target
+    if: needs.target.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: defects
+            agent: review-defects
+            model: reviewer
+          - name: standards
+            agent: review-standards
+            model: reviewer
+          - name: security
+            agent: review-security
+            model: security
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.head }}
+          fetch-depth: ${{ needs.target.outputs.depth }}
+          persist-credentials: false
+      - name: Fetch the whole history when the merge base is missing
+        env:
+          BASE: ${{ needs.target.outputs.base }}
+          HEAD: ${{ needs.target.outputs.head }}
+        run: git merge-base "$BASE" "$HEAD" > /dev/null 2>&1 || git fetch --unshallow --no-tags origin
+      - uses: actions/checkout@v4
+        with:
+          repository: mathieuletyrant/ai-pr-review
+          ref: ${{ inputs.kit-ref }}
+          path: ${{ env.TOOL }}
+          sparse-checkout: .github/ai-review
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install dependencies
+        continue-on-error: true
+        run: |
+          echo "$TOOL/" >> .git/info/exclude
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && yarn install --immutable || yarn install --frozen-lockfile
+          elif [ -f bun.lockb ] || [ -f bun.lock ]; then npx -y bun install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          fi
+      - name: Install opencode
+        run: npm install --global "opencode-ai@$OPENCODE_VERSION"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-review-pull-request
+          path: ${{ runner.temp }}/pull-request
+      - name: Review
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MODEL: ${{ matrix.model == 'security' && env.SECURITY_MODEL || env.REVIEWER_MODEL }}
+        run: >-
+          node "$TOOL/.github/ai-review/run-agent.mjs" --agent ${{ matrix.agent }} --model "$MODEL"
+          --event "$RUNNER_TEMP/pull-request/event.json" --out "$RUNNER_TEMP/${{ matrix.name }}.json"
+          --max-steps 70 --minutes 16 --sandbox
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ai-review-run-${{ matrix.name }}
+          path: ${{ runner.temp }}/${{ matrix.name }}.json
+          retention-days: 14
+
+  merge:
+    name: AI review (merge)
+    needs: [target, review]
+    if: always() && needs.target.outputs.run == 'true' && needs.review.result != 'cancelled'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.head }}
+          fetch-depth: ${{ needs.target.outputs.depth }}
+          persist-credentials: false
+      - name: Fetch the whole history when the merge base is missing
+        env:
+          BASE: ${{ needs.target.outputs.base }}
+          HEAD: ${{ needs.target.outputs.head }}
+        run: git merge-base "$BASE" "$HEAD" > /dev/null 2>&1 || git fetch --unshallow --no-tags origin
+      - uses: actions/checkout@v4
+        with:
+          repository: mathieuletyrant/ai-pr-review
+          ref: ${{ inputs.kit-ref }}
+          path: ${{ env.TOOL }}
+          sparse-checkout: .github/ai-review
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-review-pull-request
+          path: ${{ runner.temp }}/pull-request
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ai-review-run-*
+          path: ${{ runner.temp }}/reviews
+          merge-multiple: true
+      - name: Merge without a model when no reviewer raised a finding
+        id: empty
+        continue-on-error: true
+        run: >-
+          node "$TOOL/.github/ai-review/run-agent.mjs" --agent review-merge --model "$MERGER_MODEL"
+          --event "$RUNNER_TEMP/pull-request/event.json" --out "$RUNNER_TEMP/merge.json" --only-when-empty
+          --review "defects=$RUNNER_TEMP/reviews/defects.json" --review "standards=$RUNNER_TEMP/reviews/standards.json"
+          --review "security=$RUNNER_TEMP/reviews/security.json"
+      - name: Install dependencies
+        if: steps.empty.outputs.merged != 'true'
+        continue-on-error: true
+        run: |
+          echo "$TOOL/" >> .git/info/exclude
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && yarn install --immutable || yarn install --frozen-lockfile
+          elif [ -f bun.lockb ] || [ -f bun.lock ]; then npx -y bun install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          fi
+      - name: Install opencode
+        if: steps.empty.outputs.merged != 'true'
+        run: npm install --global "opencode-ai@$OPENCODE_VERSION"
+      - name: Merge the reviews
+        if: steps.empty.outputs.merged != 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: >-
+          node "$TOOL/.github/ai-review/run-agent.mjs" --agent review-merge --model "$MERGER_MODEL"
+          --event "$RUNNER_TEMP/pull-request/event.json" --out "$RUNNER_TEMP/merge.json" --max-steps 60 --minutes 12
+          --review "defects=$RUNNER_TEMP/reviews/defects.json" --review "standards=$RUNNER_TEMP/reviews/standards.json"
+          --review "security=$RUNNER_TEMP/reviews/security.json" --sandbox
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ai-review-run-merge
+          path: ${{ runner.temp }}/merge.json
+          retention-days: 14
+
+  post:
+    name: AI code review
+    needs: [target, merge]
+    if: always() && needs.target.outputs.run == 'true' && needs.merge.result != 'cancelled'
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      AI_REVIEW_APP_ID: ${{ secrets.AI_REVIEW_APP_ID }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    outputs:
+      review-url: ${{ steps.post.outputs.review-url }}
+      findings: ${{ steps.post.outputs.findings }}
+      cost: ${{ steps.post.outputs.cost }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: mathieuletyrant/ai-pr-review
+          ref: ${{ inputs.kit-ref }}
+          path: ${{ env.TOOL }}
+          sparse-checkout: .github/ai-review
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-review-pull-request
+          path: ${{ runner.temp }}/pull-request
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ai-review-run-*
+          path: ${{ runner.temp }}/runs
+          merge-multiple: true
+      - name: Mint the review app's token
+        id: app
+        if: env.AI_REVIEW_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.AI_REVIEW_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+      - name: Post the review
+        id: post
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          AI_REVIEW_BOT: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || 'github-actions[bot]' }}
+        run: node "$TOOL/.github/ai-review/post.mjs" --runs "$RUNNER_TEMP/runs" --event "$RUNNER_TEMP/pull-request/event.json"
+
+  status:
+    name: AI review (status)
+    needs: [target, review, merge, post]
+    if: always() && needs.target.outputs.run == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      AI_REVIEW_APP_ID: ${{ secrets.AI_REVIEW_APP_ID }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: mathieuletyrant/ai-pr-review
+          ref: ${{ inputs.kit-ref }}
+          path: ${{ env.TOOL }}
+          sparse-checkout: .github/ai-review
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-review-pull-request
+          path: ${{ runner.temp }}/pull-request
+      - name: Mint the review app's token
+        id: app
+        if: env.AI_REVIEW_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.AI_REVIEW_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+      - name: Mark the review finished
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          AI_REVIEW_BOT: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || 'github-actions[bot]' }}
+          STATE: >-
+            ${{ needs.post.outputs.review-url && 'completed' ||
+            contains(needs.*.result, 'cancelled') && 'cancelled' || 'failed' }}
+          FINDINGS: ${{ needs.post.outputs.findings || '0' }}
+          REVIEW_URL: ${{ needs.post.outputs.review-url }}
+          COST: ${{ needs.post.outputs.cost }}
+        run: >-
+          node "$TOOL/.github/ai-review/status.mjs" --state "$STATE" --event "$RUNNER_TEMP/pull-request/event.json"
+          --findings "$FINDINGS" --review-url "$REVIEW_URL" --cost "$COST"
